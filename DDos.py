@@ -34,7 +34,7 @@ def server_worker(server_instance):
             elif work_item["type"] == "FAKE":
                 payload = work_item["data"].get('payload_file', 'unknown')
                 ip = work_item["data"].get('source_ip', 'unknown')
-                add_server_log(f"🔥 [Flood] Processed fake request from {ip} ({payload})")
+                add_server_log(f"🔥 [Attack] Processed fake request from {ip} ({payload})")
 
             # Mark the task as done
             server_instance.request_queue.task_done()
@@ -220,9 +220,14 @@ with col2:
         success = st.session_state.server.process_request("LOGIN", data)
         
         if success:
-            add_log("✅", "[User] Login request *queued*!")
+            # THIS IS THE CHANGED LINE
+            add_log("⏳", "[User] Login request *sent*. Waiting for server...")
         else:
-            add_log("❌", "[User] LOGIN FAILED. Server is busy (queue is full).")
+            # THIS IS THE CHANGED LINE
+            add_log("⛔", "[User] LOGIN FAILED. Server queue is full, request *dropped*!")
+            
+    st.info("Watch the 'User Request Log' for 'sent' vs 'dropped', and the 'Server Processing Log' for the final 'Login Succeeded' result.")
+
 
 # --- COLUMN 3: Server State ---
 with col3:
