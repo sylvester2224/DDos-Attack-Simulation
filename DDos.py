@@ -1,33 +1,75 @@
-# dos_simulation_threadsafe.py
+# dos_sim_onefile.py
+# Single-file Streamlit app that simulates Server / Attacker / Client (safe, local).
+# - No network traffic generated.
+# - Uses local SQLite DB sim.db in the same folder.
+# - Background threads NEVER modify Streamlit session_state directly; they update DB and push events to an event_queue.
+# Run: streamlit run dos_sim_onefile.py
+
 import streamlit as st
-import threading, time, queue, random, datetime
+import sqlite3, threading, time, datetime, random, os, json
 from collections import deque
+from typing import Optional
 
-st.set_page_config(page_title="DoS Attack Simulator (Safe)", layout="wide")
+# --- Configuration ---
+DB_FILE = "sim.db"
+MAX_LOGS_SHOWN = 200
 
-# ---------- Simulation request/event objects ----------
-class SimRequest:
-    def __init__(self, req_type, user_id=None, username=None, password=None):
-        self.req_type = req_type  # 'auth' or 'fake'
-        self.user_id = user_id
-        self.username = username
-        self.password = password
-        self.arrival = datetime.datetime.now()
+# --- Helpers for DB ---
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,            -- 'auth' or 'fake'
+    username TEXT,
+    password TEXT,
+    arrival_ts TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- 'pending', 'processing', 'done'
+    result TEXT,                   -- 'success','failed','timeout' or 'consumed'
+    processed_ts TEXT
+);
 
-# An event is a simple dict pushed by worker threads into event_queue,
-# e.g. {"type":"log","msg":"..."} or {"type":"result","kind":"auth_success"} etc.
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    level TEXT,
+    msg TEXT,
+    packet TEXT
+);
+"""
 
-# ---------- Session state initialization ----------
-if "sim_running" not in st.session_state:
-    st.session_state.sim_running = False
+def init_db_file():
+    create = not os.path.exists(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    if create:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    return conn
 
-# Thread-safe queues stored in session_state (it's OK to store queue objects)
-if "req_queue" not in st.session_state:
-    st.session_state.req_queue = queue.Queue()
+def new_db_conn():
+    # Each thread should create its own connection object
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_log(conn, level, msg, packet=None):
+    ts = datetime.datetime.utcnow().isoformat()
+    conn.execute("INSERT INTO logs (ts, level, msg, packet) VALUES (?, ?, ?, ?)", (ts, level, msg, packet))
+    conn.commit()
+
+def db_insert_request(conn, typ, username=None, password=None):
+    ts = datetime.datetime.utcnow().isoformat()
+    cur = conn.execute("INSERT INTO requests (type, username, password, arrival_ts) VALUES (?, ?, ?, ?)",
+                       (typ, username, password, ts))
+    conn.commit()
+    return cur.lastrowid
+
+# --- Event queue for worker -> main thread notifications ---
+# events are dicts like {"type":"log","msg":..., "packet":...} or {"type":"queue_sample","qlen":int,"ts":...}
 if "event_queue" not in st.session_state:
+    import queue
     st.session_state.event_queue = queue.Queue()
 
-# Stats stored in session_state — only the main thread updates these
+# --- Stats in session_state (main thread updates) ---
 if "stats" not in st.session_state:
     st.session_state.stats = {
         "processed_total": 0,
@@ -35,196 +77,235 @@ if "stats" not in st.session_state:
         "processed_auth_failed": 0,
         "processed_fake": 0,
         "auth_timeouts": 0,
-        "queue_lengths": deque(maxlen=200),
-        "timestamps": deque(maxlen=200),
-        "recent_logs": deque(maxlen=500),
+        "queue_lengths": deque(maxlen=300),
+        "timestamps": deque(maxlen=300),
+        "recent_logs": deque(maxlen=1000)
     }
 
-if "threads" not in st.session_state:
-    st.session_state.threads = []
-if "stop_event" not in st.session_state:
-    st.session_state.stop_event = threading.Event()
-if "auto_refresh" not in st.session_state:
-    st.session_state.auto_refresh = False
+# --- Thread control flags stored in session_state ---
+if "server_thread" not in st.session_state:
+    st.session_state.server_thread = None
+if "attacker_thread" not in st.session_state:
+    st.session_state.attacker_thread = None
+if "server_stop" not in st.session_state:
+    st.session_state.server_stop = threading.Event()
+if "attacker_stop" not in st.session_state:
+    st.session_state.attacker_stop = threading.Event()
 
-# ---------- Controls ----------
-st.title("DoS Attack Simulator — **Safe & Thread-Safe**")
-st.markdown(
+# --- Simulated server credentials ---
+SERVER_CREDENTIALS = {"admin": "P@ssw0rd"}
+
+# --- Worker implementations (they operate on DB and push events into st.session_state.event_queue) ---
+
+def attacker_worker(rate_per_sec: float, burst: int, stop_event: threading.Event):
     """
-This is an **offline** simulation. All background threads push events into a queue;
-the main Streamlit thread drains that queue and updates UI state — avoiding thread-safety issues.
-"""
-)
-
-with st.sidebar:
-    st.header("Simulation controls")
-    auth_rate = st.slider("Legitimate users: login attempts / sec (total)", 0, 50, 5)
-    num_legit_users = st.slider("Number of legitimate users (simulated)", 1, 10, 3)
-    attacker_rate = st.slider("Attacker flood: requests / sec", 0, 500, 80)
-    server_capacity = st.slider("Server processing capacity (requests / sec)", 1, 200, 25)
-    auth_timeout_s = st.slider("Auth attempt timeout (seconds)", 1, 10, 3)
-    simulation_tick = st.slider("Simulation tick interval (ms)", 100, 2000, 300)
-    st.markdown("---")
-    if not st.session_state.sim_running:
-        if st.button("Start simulation"):
-            st.session_state.stop_event.clear()
-            st.session_state.sim_running = True
-    else:
-        if st.button("Stop simulation"):
-            st.session_state.stop_event.set()
-            st.session_state.sim_running = False
-
-    if st.button("Reset stats & queue"):
-        # stop first
-        st.session_state.stop_event.set()
-        st.session_state.sim_running = False
-        # clear request queue and event queue
-        while not st.session_state.req_queue.empty():
-            try: st.session_state.req_queue.get_nowait()
-            except: break
-        while not st.session_state.event_queue.empty():
-            try: st.session_state.event_queue.get_nowait()
-            except: break
-        # reset stats
-        st.session_state.stats = {
-            "processed_total": 0,
-            "processed_auth_success": 0,
-            "processed_auth_failed": 0,
-            "processed_fake": 0,
-            "auth_timeouts": 0,
-            "queue_lengths": deque(maxlen=200),
-            "timestamps": deque(maxlen=200),
-            "recent_logs": deque(maxlen=500),
-        }
-        st.success("Reset complete")
-
-    st.markdown("---")
-    st.checkbox("Auto-refresh UI (every 1s)", value=st.session_state.auto_refresh, key="auto_refresh")
-
-# ---------- Server credentials (simulated) ----------
-SERVER_CREDENTIALS = {"admin": "P@ssw0rd"}  # correct credentials for simulation
-
-# ---------- Worker functions (they NEVER touch st.session_state directly) ----------
-def legit_user_worker(stop_event, rate_per_sec, num_users, tick_ms, req_q, evt_q):
+    Inserts fake requests into DB at rate_per_sec (approx) with optional burst size.
+    Also logs a mock 'packet' dump in logs table.
+    """
+    conn = new_db_conn()
     if rate_per_sec <= 0:
+        # do nothing but wait for stop
         while not stop_event.is_set():
             time.sleep(0.2)
-        return
-    per_user_rate = rate_per_sec / max(1, num_users)
-    next_fire = [time.time()] * num_users
-    while not stop_event.is_set():
-        now = time.time()
-        for uid in range(num_users):
-            if now >= next_fire[uid]:
-                username = "admin" if random.random() < 0.9 else f"user{uid}"
-                password = SERVER_CREDENTIALS.get("admin") if random.random() < 0.8 else "wrongpass"
-                req = SimRequest("auth", user_id=uid, username=username, password=password)
-                req_q.put(req)
-                # push a log event
-                evt_q.put({"type":"log","msg":f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH attempt from user{uid} (username={username})"})
-                interval = 1.0 / per_user_rate if per_user_rate > 0 else 1.0
-                next_fire[uid] = now + random.uniform(interval * 0.7, interval * 1.3)
-        time.sleep(max(0.01, tick_ms / 1000.0))
-
-def attacker_worker(stop_event, rate_per_sec, tick_ms, req_q, evt_q):
-    if rate_per_sec <= 0:
-        while not stop_event.is_set():
-            time.sleep(0.2)
+        conn.close()
         return
     interval = 1.0 / rate_per_sec
-    next_fire = time.time()
-    while not stop_event.is_set():
-        now = time.time()
-        if now >= next_fire:
-            bursts = random.choice([1,1,1,2,3])
-            for _ in range(bursts):
-                req_q.put(SimRequest("fake"))
-            evt_q.put({"type":"log","msg":f"{datetime.datetime.now().strftime('%H:%M:%S')} ATTACKER sent {bursts} fake req(s)"})
-            next_fire = now + random.uniform(interval * 0.8, interval * 1.2)
-        time.sleep(max(0.001, tick_ms / 1000.0))
+    try:
+        while not stop_event.is_set():
+            # insert burst
+            created = []
+            for _ in range(burst):
+                req_id = db_insert_request(conn, "fake")
+                created.append(req_id)
+            # log packet-like summaries
+            ts = datetime.datetime.utcnow().isoformat()
+            for req_id in created:
+                packet = f"FAKE_PKT id={req_id} src=10.0.0.{random.randint(2,254)} dst=127.0.0.1 proto=UDP len={random.randint(40,1400)} ts={ts}"
+                db_log(conn, "ATTACK", f"Attacker inserted fake req id={req_id}", packet)
+                # notify main thread with a log event
+                st.session_state.event_queue.put({"type":"log","msg":f"{ts} ATTACK inserted id={req_id}","packet":packet})
+            # schedule next with jitter
+            time.sleep(max(0.0005, interval * random.uniform(0.8, 1.2)))
+    except Exception as e:
+        # ensure we record errors to DB so main UI can show
+        db_log(conn, "ERROR", f"Attacker worker error: {e}", None)
+        st.session_state.event_queue.put({"type":"log","msg":f"Attacker errored: {e}","packet":None})
+    finally:
+        conn.close()
 
-def server_worker(stop_event, capacity_per_sec, auth_timeout, req_q, evt_q):
-    tick = 0.25  # seconds
-    processed_per_tick_float = capacity_per_sec * tick
+def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, stop_event: threading.Event):
+    """
+    Processes pending requests from DB, up to capacity_per_sec per second (distributed across ticks).
+    Emits events to event_queue: log messages and queue samples.
+    """
+    conn = new_db_conn()
+    processed_per_tick = capacity_per_sec * tick
     remainder = 0.0
-    while not stop_event.is_set():
-        start = time.time()
-        to_process = int(processed_per_tick_float)
-        remainder += (processed_per_tick_float - to_process)
-        if remainder >= 1.0:
-            to_process += 1
-            remainder -= 1.0
-        for _ in range(to_process):
-            if stop_event.is_set():
-                break
-            try:
-                req = req_q.get(timeout=0.0)
-            except Exception:
-                break
-            # process request *inside worker* and emit events (not update st.session_state)
-            age = (datetime.datetime.now() - req.arrival).total_seconds()
-            if req.req_type == "auth":
-                if age > auth_timeout:
-                    evt_q.put({"type":"result","kind":"auth_timeout","user_id":req.user_id})
-                    evt_q.put({"type":"log","msg":f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH timeout for user{req.user_id}"})
-                else:
-                    correct = SERVER_CREDENTIALS.get(req.username)
-                    if correct is not None and req.password == correct:
-                        evt_q.put({"type":"result","kind":"auth_success","user_id":req.user_id})
-                        evt_q.put({"type":"log","msg":f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH success user{req.user_id}"})
+    try:
+        while not stop_event.is_set():
+            start = time.time()
+            to_process = int(processed_per_tick)
+            remainder += (processed_per_tick - to_process)
+            if remainder >= 1.0:
+                to_process += 1
+                remainder -= 1.0
+            for _ in range(to_process):
+                # pick one pending request
+                cur = conn.execute("SELECT * FROM requests WHERE status='pending' ORDER BY id LIMIT 1")
+                row = cur.fetchone()
+                if not row:
+                    break
+                # mark processing
+                conn.execute("UPDATE requests SET status='processing' WHERE id=?", (row["id"],))
+                conn.commit()
+                # simulate processing CPU time
+                time.sleep(0.003 + random.random() * 0.01)
+                arrival = datetime.datetime.fromisoformat(row["arrival_ts"])
+                age = (datetime.datetime.utcnow() - arrival).total_seconds()
+                if row["type"] == "auth":
+                    if age > auth_timeout:
+                        result = "timeout"
+                        msg = f"AUTH timeout id={row['id']} user={row['username']}"
+                        db_log(conn, "WARN", msg, None)
+                        st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} {msg}","packet":None})
+                        # notify result to main thread
+                        st.session_state.event_queue.put({"type":"result","kind":"auth_timeout"})
                     else:
-                        evt_q.put({"type":"result","kind":"auth_failed","user_id":req.user_id})
-                        evt_q.put({"type":"log","msg":f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH failed user{req.user_id}"})
-            else:
-                evt_q.put({"type":"result","kind":"fake_processed"})
-        # push queue-length sample event for plotting
-        evt_q.put({"type":"queue_sample","qlen":req_q.qsize(),"ts":datetime.datetime.now().strftime("%H:%M:%S")})
-        elapsed = time.time() - start
-        time.sleep(max(0.0, tick - elapsed))
+                        correct = SERVER_CREDENTIALS.get(row["username"])
+                        if correct is not None and row["password"] == correct:
+                            result = "success"
+                            msg = f"AUTH success id={row['id']} user={row['username']}"
+                            db_log(conn, "INFO", msg, None)
+                            st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} {msg}","packet":None})
+                            st.session_state.event_queue.put({"type":"result","kind":"auth_success"})
+                        else:
+                            result = "failed"
+                            msg = f"AUTH failed id={row['id']} user={row['username']}"
+                            db_log(conn, "INFO", msg, None)
+                            st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} {msg}","packet":None})
+                            st.session_state.event_queue.put({"type":"result","kind":"auth_failed"})
+                    conn.execute("UPDATE requests SET status='done', result=?, processed_ts=? WHERE id=?",
+                                 (result, datetime.datetime.utcnow().isoformat(), row["id"]))
+                    conn.commit()
+                else:
+                    # fake request consumed
+                    result = "consumed"
+                    msg = f"Fake consumed id={row['id']}"
+                    db_log(conn, "DEBUG", msg, None)
+                    st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} {msg}","packet":None})
+                    conn.execute("UPDATE requests SET status='done', result=?, processed_ts=? WHERE id=?",
+                                 (result, datetime.datetime.utcnow().isoformat(), row["id"]))
+                    conn.commit()
+            # queue sample
+            qlen = conn.execute("SELECT COUNT(*) as c FROM requests WHERE status='pending'").fetchone()["c"]
+            st.session_state.event_queue.put({"type":"queue_sample","qlen":qlen,"ts":datetime.datetime.utcnow().strftime("%H:%M:%S")})
+            elapsed = time.time() - start
+            time.sleep(max(0.0, tick - elapsed))
+    except Exception as e:
+        db_log(conn, "ERROR", f"Server worker error: {e}", None)
+        st.session_state.event_queue.put({"type":"log","msg":f"Server errored: {e}","packet":None})
+    finally:
+        conn.close()
 
-# ---------- Thread lifecycle helpers ----------
-def ensure_threads_running():
-    if st.session_state.sim_running and (not st.session_state.threads or not any(t.is_alive() for t in st.session_state.threads)):
-        st.session_state.stop_event.clear()
-        st.session_state.threads = []
-        t_legit = threading.Thread(target=legit_user_worker, args=(
-            st.session_state.stop_event, auth_rate, num_legit_users, simulation_tick,
-            st.session_state.req_queue, st.session_state.event_queue
-        ), daemon=True)
-        t_attack = threading.Thread(target=attacker_worker, args=(
-            st.session_state.stop_event, attacker_rate, simulation_tick,
-            st.session_state.req_queue, st.session_state.event_queue
-        ), daemon=True)
-        t_server = threading.Thread(target=server_worker, args=(
-            st.session_state.stop_event, server_capacity, auth_timeout_s,
-            st.session_state.req_queue, st.session_state.event_queue
-        ), daemon=True)
-        st.session_state.threads = [t_legit, t_attack, t_server]
-        for t in st.session_state.threads:
+# --- UI / Control logic ---
+st.set_page_config(page_title="DoS Simulator — Single App", layout="wide")
+st.title("DoS Simulation — Server + Attacker + Client (single Streamlit app)")
+
+# Initialize DB (if not exists)
+init_db_file()
+
+# UI: Controls
+with st.sidebar:
+    st.header("Simulation Controls")
+    server_capacity = st.number_input("Server capacity (requests/sec)", min_value=1.0, max_value=2000.0, value=25.0, step=1.0, format="%.1f")
+    auth_timeout = st.number_input("Auth timeout (seconds)", min_value=0.5, max_value=60.0, value=3.0, step=0.5)
+    server_tick = st.number_input("Server tick (seconds)", min_value=0.05, max_value=2.0, value=0.25, step=0.05, format="%.2f")
+
+    st.markdown("---")
+    attacker_rate = st.number_input("Attacker rate (fake reqs/sec)", min_value=0.0, max_value=5000.0, value=80.0, step=1.0)
+    attacker_burst = st.number_input("Attacker burst size (per insertion)", min_value=1, max_value=50, value=1, step=1)
+
+    st.markdown("---")
+    # Server start/stop buttons
+    if st.session_state.server_thread is None or not st.session_state.server_thread.is_alive():
+        if st.button("Start Server"):
+            st.session_state.server_stop.clear()
+            t = threading.Thread(target=server_worker, args=(server_capacity, auth_timeout, server_tick, st.session_state.server_stop), daemon=True)
+            st.session_state.server_thread = t
             t.start()
+            st.success("Server thread started.")
+    else:
+        if st.button("Stop Server"):
+            st.session_state.server_stop.set()
+            st.success("Server stop requested; thread will stop soon.")
 
-def stop_threads():
-    st.session_state.stop_event.set()
+    # Attacker toggle
+    if st.session_state.attacker_thread is None or not st.session_state.attacker_thread.is_alive():
+        if st.button("Start Attacker"):
+            st.session_state.attacker_stop.clear()
+            t = threading.Thread(target=attacker_worker, args=(attacker_rate, attacker_burst, st.session_state.attacker_stop), daemon=True)
+            st.session_state.attacker_thread = t
+            t.start()
+            st.success("Attacker started.")
+    else:
+        if st.button("Stop Attacker"):
+            st.session_state.attacker_stop.set()
+            st.success("Attacker stop requested; thread will stop soon.")
 
-# Start/stop handling
-if st.session_state.sim_running:
-    ensure_threads_running()
-else:
-    stop_threads()
+    st.markdown("---")
+    st.checkbox("Auto-refresh UI (1s)", value=True, key="auto_refresh")
 
-# ---------- MAIN THREAD: drain event queue and update session_state.stats safely ----------
-def drain_events_and_apply(max_items=1000):
-    applied = 0
-    while not st.session_state.event_queue.empty() and applied < max_items:
+# Main UI layout: top metrics
+conn_main = new_db_conn()
+col1, col2, col3 = st.columns([1.2, 1, 1])
+
+with col1:
+    qlen_now = conn_main.execute("SELECT COUNT(*) as c FROM requests WHERE status='pending'").fetchone()["c"]
+    st.metric("Queue length (pending)", qlen_now)
+    st.write("Server running:", "Yes" if st.session_state.server_thread and st.session_state.server_thread.is_alive() else "No")
+    st.write("Attacker running:", "Yes" if st.session_state.attacker_thread and st.session_state.attacker_thread.is_alive() else "No")
+
+with col2:
+    st.metric("Processed total", st.session_state.stats["processed_total"])
+    st.metric("Processed fake", st.session_state.stats["processed_fake"])
+
+with col3:
+    st.metric("Auth successes", st.session_state.stats["processed_auth_success"])
+    st.metric("Auth failures", st.session_state.stats["processed_auth_failed"])
+    st.metric("Auth timeouts", st.session_state.stats["auth_timeouts"])
+
+st.markdown("---")
+
+# Client: submit login attempts
+st.subheader("Client: Submit login")
+with st.form("login_form", clear_on_submit=True):
+    username = st.text_input("Username", value="admin")
+    password = st.text_input("Password", type="password", value="P@ssw0rd")
+    submitted = st.form_submit_button("Submit login request")
+    if submitted:
+        conn = new_db_conn()
+        req_id = db_insert_request(conn, "auth", username=username, password=password)
+        db_log(conn, "INFO", f"Client submitted auth id={req_id} user={username}", None)
+        st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} Client submitted auth id={req_id} user={username}","packet":None})
+        st.success(f"Auth request queued (id={req_id}). Poll logs or enable auto-refresh to see result.")
+
+st.markdown("---")
+
+# Drain events from event_queue (main thread) and update st.session_state.stats safely
+def drain_events(max_items=1000):
+    count = 0
+    while not st.session_state.event_queue.empty() and count < max_items:
         try:
             evt = st.session_state.event_queue.get_nowait()
         except Exception:
             break
-        applied += 1
-        t = evt.get("type")
-        if t == "log":
-            st.session_state.stats["recent_logs"].append(evt.get("msg", ""))
-        elif t == "result":
+        count += 1
+        etype = evt.get("type")
+        if etype == "log":
+            msg = evt.get("msg", "")
+            packet = evt.get("packet")
+            st.session_state.stats["recent_logs"].appendleft({"ts": datetime.datetime.utcnow().isoformat(), "level":"EVENT", "msg": msg, "packet": packet})
+        elif etype == "result":
             kind = evt.get("kind")
             if kind == "auth_success":
                 st.session_state.stats["processed_auth_success"] += 1
@@ -239,97 +320,65 @@ def drain_events_and_apply(max_items=1000):
             elif kind == "fake_processed":
                 st.session_state.stats["processed_fake"] += 1
                 st.session_state.stats["processed_total"] += 1
-        elif t == "queue_sample":
-            st.session_state.stats["queue_lengths"].append(evt.get("qlen", 0))
-            st.session_state.stats["timestamps"].append(evt.get("ts", datetime.datetime.now().strftime("%H:%M:%S")))
-    # optionally return number processed
-    return applied
+        elif etype == "queue_sample":
+            q = evt.get("qlen", 0)
+            ts = evt.get("ts", datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            st.session_state.stats["queue_lengths"].append(q)
+            st.session_state.stats["timestamps"].append(ts)
+    return count
 
-# Drain events now (safe single-threaded)
-drain_events_and_apply()
+drain_events()
 
-# ---------- UI display ----------
-col1, col2, col3 = st.columns([1.2, 1, 1])
-with col1:
-    st.subheader("Server queue")
-    qlen = st.session_state.req_queue.qsize()
-    st.metric("Current queue length", qlen)
-    st.write("Processing capacity (req/sec):", server_capacity)
-    st.write("Legit rate (req/sec):", auth_rate)
-    st.write("Attacker rate (req/sec):", attacker_rate)
-
-with col2:
-    st.subheader("Auth results")
-    st.metric("Auth successes", st.session_state.stats["processed_auth_success"])
-    st.metric("Auth failures", st.session_state.stats["processed_auth_failed"])
-    st.metric("Auth timeouts", st.session_state.stats["auth_timeouts"])
-
-with col3:
-    st.subheader("Traffic & processing")
-    st.metric("Processed total", st.session_state.stats["processed_total"])
-    st.metric("Processed fake", st.session_state.stats["processed_fake"])
-
-st.markdown("---")
-chart_col, log_col = st.columns([2, 1])
+# Show queue chart and logs
+chart_col, logs_col = st.columns([2, 1])
 with chart_col:
     st.subheader("Queue length over time")
     if st.session_state.stats["queue_lengths"]:
         import pandas as pd
-        df = pd.DataFrame({
-            "time": list(st.session_state.stats["timestamps"]),
-            "queue": list(st.session_state.stats["queue_lengths"])
-        })
+        df = pd.DataFrame({"time": list(st.session_state.stats["timestamps"]), "queue": list(st.session_state.stats["queue_lengths"])})
         if not df.empty:
             df = df.set_index("time")
             st.line_chart(df)
 
-with log_col:
-    st.subheader("Recent events")
-    logs = list(st.session_state.stats["recent_logs"])[-20:][::-1]
-    for l in logs:
-        st.write(l)
+with logs_col:
+    st.subheader("Live logs (most recent)")
+    # additionally include logs stored in DB (most recent)
+    rows = conn_main.execute("SELECT ts, level, msg, packet FROM logs ORDER BY id DESC LIMIT ?", (MAX_LOGS_SHOWN,)).fetchall()
+    # show top N
+    for r in rows[:50]:
+        ts = r["ts"]
+        level = r["level"]
+        msg = r["msg"]
+        packet = r["packet"]
+        if packet:
+            st.markdown(f"**{ts}** — `{level}` — {msg}  \n```\n{packet}\n```")
+        else:
+            st.markdown(f"**{ts}** — `{level}` — {msg}")
 
 st.markdown("---")
-st.subheader("Simulation details / what this models")
-st.markdown(
-    """
-    - This is a behavioural simulator: **no network traffic** is generated.
-    - Background threads only push events into queues; the main thread applies state updates.
-    - This avoids thread-safety problems with Streamlit.
-    """
-)
+st.subheader("Recent auth requests (last 50)")
+rows = conn_main.execute("SELECT id, username, arrival_ts, status, result, processed_ts FROM requests WHERE type='auth' ORDER BY id DESC LIMIT 50").fetchall()
+if rows:
+    for r in rows:
+        st.write(dict(r))
+else:
+    st.write("No auth requests yet.")
 
-st.markdown("----")
-st.caption("Safe simulation for learning and testing. No real networking or attack code is present.")
-
-# allow exporting stats snapshot
+# Export snapshot
 if st.button("Export stats snapshot (JSON)"):
-    import json
     snapshot = {
         "processed_total": st.session_state.stats["processed_total"],
         "processed_auth_success": st.session_state.stats["processed_auth_success"],
         "processed_auth_failed": st.session_state.stats["processed_auth_failed"],
         "processed_fake": st.session_state.stats["processed_fake"],
         "auth_timeouts": st.session_state.stats["auth_timeouts"],
-        "queue_length_now": st.session_state.req_queue.qsize(),
-        "timestamp": datetime.datetime.now().isoformat(),
+        "queue_length_now": conn_main.execute("SELECT COUNT(*) as c FROM requests WHERE status='pending'").fetchone()["c"],
+        "timestamp": datetime.datetime.utcnow().isoformat(),
     }
     st.download_button("Download snapshot as JSON", data=json.dumps(snapshot, indent=2), file_name="dos_sim_snapshot.json", mime="application/json")
 
-# Manual refresh button (safe)
-refresh_col1, refresh_col2 = st.columns([1, 1])
-with refresh_col1:
-    if st.button("Refresh UI now"):
-        # Drain events so latest info is present immediately
-        drain_events_and_apply()
-        # No experimental_rerun here; clicking causes a re-run naturally
-with refresh_col2:
-    if st.session_state.auto_refresh:
-        # If auto-refresh enabled, re-run after 1 second by using st.experimental_sleep loop:
-        # Note: rather than calling experimental_rerun from background, we let Streamlit finish and then re-run.
-        drain_events_and_apply()
-        time.sleep(1)
-        # No direct call to experimental_rerun(); Streamlit will re-run periodically when widgets change or user interacts.
-        # Some deployments may still require manual refresh; if you want a deterministic auto-reload we can add a JS component.
-
-# Done. Important: background threads NEVER modify st.session_state directly.
+# Auto-refresh
+if st.session_state.auto_refresh:
+    # let server/attacker threads run; we sleep then re-run to update UI
+    time.sleep(1)
+    st.experimental_rerun()
