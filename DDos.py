@@ -6,6 +6,33 @@ import threading
 # ---
 # 1. Server Simulation
 # ---
+
+def server_worker(server_instance):
+    """
+    This runs in a separate thread, simulating the server's *actual* work.
+    It pulls from the queue and "processes" items one by one.
+    This represents the server's fixed processing capacity (e.g., 10 reqs/sec).
+    """
+    while True:
+        try:
+            # Get an item from the queue (this blocks until an item is available)
+            server_instance.request_queue.get()
+            
+            # Simulate the work (e.g., 0.1 seconds)
+            # This is the server's *actual* processing speed bottleneck.
+            time.sleep(0.1) 
+            
+            # Mark the task as done
+            server_instance.request_queue.task_done()
+            
+            # Update the UI after processing
+            with server_instance.lock:
+                st.session_state.current_queue_size = server_instance.request_queue.qsize()
+                
+        except Exception as e:
+            # Handle potential errors (e.g., if queue is shut down)
+            pass
+
 class SimulatedServer:
     def __init__(self, queue_size=10):
         self.request_queue = queue.Queue(maxsize=queue_size)
@@ -15,9 +42,9 @@ class SimulatedServer:
 
     def process_request(self, request_type, data):
         """
-        Simulates the server trying to process a request.
+        Simulates *accepting* a request into the queue.
         If the queue is full, it returns False (request dropped).
-        This function is thread-safe.
+        This function is thread-safe and *fast*.
         """
         with self.lock:
             # Update queue size for UI
@@ -38,16 +65,10 @@ class SimulatedServer:
                 # Fake requests are just processed
                 result = "Fake Request Processed"
             
-            # Add to queue and simulate work
+            # Add to queue for the *worker* to process
             self.request_queue.put(result)
             st.session_state.current_queue_size = self.request_queue.qsize() # Update UI
-            
-            # Simulate work (e.g., 0.1 seconds)
-            time.sleep(0.1) 
-            
-            self.request_queue.get() # Finish work
-            st.session_state.current_queue_size = self.request_queue.qsize() # Update UI
-            return True
+            return True # Request was *queued*
 
 # ---
 # 2. Streamlit App UI
@@ -65,6 +86,11 @@ default_queue_size = st.session_state.get('setting_queue_size', 20)
 
 if 'server' not in st.session_state:
     st.session_state.server = SimulatedServer(queue_size=default_queue_size)
+    # Start the server's background worker thread
+    worker_t = threading.Thread(target=server_worker, args=(st.session_state.server,))
+    worker_t.daemon = True
+    worker_t.start()
+    
 if 'attack_running' not in st.session_state:
     st.session_state.attack_running = False
 if 'log' not in st.session_state:
@@ -97,6 +123,7 @@ def attacker_thread(attacker_id):
         attack_speed = st.session_state.get('setting_attack_speed', 20)
         sleep_time = 1.0 / attack_speed
         
+        # Now calls the *fast* process_request
         success = st.session_state.server.process_request("FAKE", {})
         
         if not success:
@@ -139,12 +166,21 @@ with st.sidebar:
     if st.button("Apply Settings & Restart Server"):
         st.session_state.attack_running = False # Stop any old attack
         time.sleep(0.5) # Give threads time to stop
+        
+        # Create the new server
         st.session_state.server = SimulatedServer(
             queue_size=st.session_state.setting_queue_size
         )
+        
+        # Start a worker for the *new* server
+        worker_t = threading.Thread(target=server_worker, args=(st.session_state.server,))
+        worker_t.daemon = True
+        worker_t.start()
+        
         st.session_state.current_queue_size = 0
         st.session_state.log = []
         add_log("🔄", f"Server Restarted. Queue Size: {st.session_state.setting_queue_size}")
+        add_log("🚀", "Server worker thread started.")
         st.rerun()
 
 # --- Main Columns ---
@@ -184,17 +220,19 @@ with col2:
     if submitted:
         add_log("⏳", "[User] Attempting to log in...")
         data = {"user": st.session_state.user, "pwd": st.session_state.pwd}
+        
+        # This now calls the fast-queuing function
         success = st.session_state.server.process_request("LOGIN", data)
         
         if success:
-            add_log("✅", "[User] Login request processed!")
+            add_log("✅", "[User] Login request *queued*!")
         else:
             add_log("❌", "[User] LOGIN FAILED. Server is busy (queue is full).")
 
 # --- COLUMN 3: Server State ---
 with col3:
     st.header("📦 Server")
-    st.info("The server has a limited queue. If it's full, it drops new requests.")
+    st.info("A background worker processes ~10 reqs/sec. If the queue fills, requests are dropped.")
     
     # Get current and max queue size
     current_q = st.session_state.get('current_queue_size', 0)
