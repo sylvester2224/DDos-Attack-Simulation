@@ -1,29 +1,27 @@
-# dos_sim_onefile.py
+# dos_sim_onefile_fixed.py
 # Single-file Streamlit app that simulates Server / Attacker / Client (safe, local).
-# - No network traffic generated.
-# - Uses local SQLite DB sim.db in the same folder.
-# - Background threads NEVER modify Streamlit session_state directly; they update DB and push events to an event_queue.
-# Run: streamlit run dos_sim_onefile.py
+# Fixed: removed direct calls to st.experimental_rerun(); uses st_autorefresh if available.
+# Run: pip install streamlit streamlit-autorefresh
+#      streamlit run dos_sim_onefile_fixed.py
 
 import streamlit as st
 import sqlite3, threading, time, datetime, random, os, json
 from collections import deque
-from typing import Optional
 
-# --- Configuration ---
+# --- Config ---
 DB_FILE = "sim.db"
 MAX_LOGS_SHOWN = 200
 
-# --- Helpers for DB ---
+# --- DB schema ---
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL,            -- 'auth' or 'fake'
+    type TEXT NOT NULL,
     username TEXT,
     password TEXT,
     arrival_ts TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- 'pending', 'processing', 'done'
-    result TEXT,                   -- 'success','failed','timeout' or 'consumed'
+    status TEXT DEFAULT 'pending',
+    result TEXT,
     processed_ts TEXT
 );
 
@@ -46,7 +44,6 @@ def init_db_file():
     return conn
 
 def new_db_conn():
-    # Each thread should create its own connection object
     conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -63,13 +60,12 @@ def db_insert_request(conn, typ, username=None, password=None):
     conn.commit()
     return cur.lastrowid
 
-# --- Event queue for worker -> main thread notifications ---
-# events are dicts like {"type":"log","msg":..., "packet":...} or {"type":"queue_sample","qlen":int,"ts":...}
+# --- event queue for worker -> main thread notifications ---
 if "event_queue" not in st.session_state:
     import queue
     st.session_state.event_queue = queue.Queue()
 
-# --- Stats in session_state (main thread updates) ---
+# --- Stats (main thread updates) ---
 if "stats" not in st.session_state:
     st.session_state.stats = {
         "processed_total": 0,
@@ -82,7 +78,7 @@ if "stats" not in st.session_state:
         "recent_logs": deque(maxlen=1000)
     }
 
-# --- Thread control flags stored in session_state ---
+# --- Thread control ---
 if "server_thread" not in st.session_state:
     st.session_state.server_thread = None
 if "attacker_thread" not in st.session_state:
@@ -92,19 +88,13 @@ if "server_stop" not in st.session_state:
 if "attacker_stop" not in st.session_state:
     st.session_state.attacker_stop = threading.Event()
 
-# --- Simulated server credentials ---
+# --- Simulated credentials ---
 SERVER_CREDENTIALS = {"admin": "P@ssw0rd"}
 
-# --- Worker implementations (they operate on DB and push events into st.session_state.event_queue) ---
-
+# --- Workers (write to DB and push events to event_queue) ---
 def attacker_worker(rate_per_sec: float, burst: int, stop_event: threading.Event):
-    """
-    Inserts fake requests into DB at rate_per_sec (approx) with optional burst size.
-    Also logs a mock 'packet' dump in logs table.
-    """
     conn = new_db_conn()
     if rate_per_sec <= 0:
-        # do nothing but wait for stop
         while not stop_event.is_set():
             time.sleep(0.2)
         conn.close()
@@ -112,32 +102,23 @@ def attacker_worker(rate_per_sec: float, burst: int, stop_event: threading.Event
     interval = 1.0 / rate_per_sec
     try:
         while not stop_event.is_set():
-            # insert burst
             created = []
             for _ in range(burst):
                 req_id = db_insert_request(conn, "fake")
                 created.append(req_id)
-            # log packet-like summaries
             ts = datetime.datetime.utcnow().isoformat()
             for req_id in created:
                 packet = f"FAKE_PKT id={req_id} src=10.0.0.{random.randint(2,254)} dst=127.0.0.1 proto=UDP len={random.randint(40,1400)} ts={ts}"
                 db_log(conn, "ATTACK", f"Attacker inserted fake req id={req_id}", packet)
-                # notify main thread with a log event
                 st.session_state.event_queue.put({"type":"log","msg":f"{ts} ATTACK inserted id={req_id}","packet":packet})
-            # schedule next with jitter
             time.sleep(max(0.0005, interval * random.uniform(0.8, 1.2)))
     except Exception as e:
-        # ensure we record errors to DB so main UI can show
         db_log(conn, "ERROR", f"Attacker worker error: {e}", None)
         st.session_state.event_queue.put({"type":"log","msg":f"Attacker errored: {e}","packet":None})
     finally:
         conn.close()
 
 def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, stop_event: threading.Event):
-    """
-    Processes pending requests from DB, up to capacity_per_sec per second (distributed across ticks).
-    Emits events to event_queue: log messages and queue samples.
-    """
     conn = new_db_conn()
     processed_per_tick = capacity_per_sec * tick
     remainder = 0.0
@@ -150,15 +131,12 @@ def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, sto
                 to_process += 1
                 remainder -= 1.0
             for _ in range(to_process):
-                # pick one pending request
                 cur = conn.execute("SELECT * FROM requests WHERE status='pending' ORDER BY id LIMIT 1")
                 row = cur.fetchone()
                 if not row:
                     break
-                # mark processing
                 conn.execute("UPDATE requests SET status='processing' WHERE id=?", (row["id"],))
                 conn.commit()
-                # simulate processing CPU time
                 time.sleep(0.003 + random.random() * 0.01)
                 arrival = datetime.datetime.fromisoformat(row["arrival_ts"])
                 age = (datetime.datetime.utcnow() - arrival).total_seconds()
@@ -168,7 +146,6 @@ def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, sto
                         msg = f"AUTH timeout id={row['id']} user={row['username']}"
                         db_log(conn, "WARN", msg, None)
                         st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} {msg}","packet":None})
-                        # notify result to main thread
                         st.session_state.event_queue.put({"type":"result","kind":"auth_timeout"})
                     else:
                         correct = SERVER_CREDENTIALS.get(row["username"])
@@ -188,7 +165,6 @@ def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, sto
                                  (result, datetime.datetime.utcnow().isoformat(), row["id"]))
                     conn.commit()
                 else:
-                    # fake request consumed
                     result = "consumed"
                     msg = f"Fake consumed id={row['id']}"
                     db_log(conn, "DEBUG", msg, None)
@@ -196,7 +172,6 @@ def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, sto
                     conn.execute("UPDATE requests SET status='done', result=?, processed_ts=? WHERE id=?",
                                  (result, datetime.datetime.utcnow().isoformat(), row["id"]))
                     conn.commit()
-            # queue sample
             qlen = conn.execute("SELECT COUNT(*) as c FROM requests WHERE status='pending'").fetchone()["c"]
             st.session_state.event_queue.put({"type":"queue_sample","qlen":qlen,"ts":datetime.datetime.utcnow().strftime("%H:%M:%S")})
             elapsed = time.time() - start
@@ -207,14 +182,12 @@ def server_worker(capacity_per_sec: float, auth_timeout: float, tick: float, sto
     finally:
         conn.close()
 
-# --- UI / Control logic ---
-st.set_page_config(page_title="DoS Simulator — Single App", layout="wide")
-st.title("DoS Simulation — Server + Attacker + Client (single Streamlit app)")
+# --- UI ---
+st.set_page_config(page_title="DoS Simulator — Fixed", layout="wide")
+st.title("DoS Simulation — Server + Attacker + Client (fixed auto-refresh)")
 
-# Initialize DB (if not exists)
 init_db_file()
 
-# UI: Controls
 with st.sidebar:
     st.header("Simulation Controls")
     server_capacity = st.number_input("Server capacity (requests/sec)", min_value=1.0, max_value=2000.0, value=25.0, step=1.0, format="%.1f")
@@ -226,7 +199,6 @@ with st.sidebar:
     attacker_burst = st.number_input("Attacker burst size (per insertion)", min_value=1, max_value=50, value=1, step=1)
 
     st.markdown("---")
-    # Server start/stop buttons
     if st.session_state.server_thread is None or not st.session_state.server_thread.is_alive():
         if st.button("Start Server"):
             st.session_state.server_stop.clear()
@@ -239,7 +211,6 @@ with st.sidebar:
             st.session_state.server_stop.set()
             st.success("Server stop requested; thread will stop soon.")
 
-    # Attacker toggle
     if st.session_state.attacker_thread is None or not st.session_state.attacker_thread.is_alive():
         if st.button("Start Attacker"):
             st.session_state.attacker_stop.clear()
@@ -253,30 +224,25 @@ with st.sidebar:
             st.success("Attacker stop requested; thread will stop soon.")
 
     st.markdown("---")
-    st.checkbox("Auto-refresh UI (1s)", value=True, key="auto_refresh")
+    st.checkbox("Auto-refresh UI (1s) — uses streamlit-autorefresh if installed", value=True, key="auto_refresh")
 
-# Main UI layout: top metrics
+# Main metrics
 conn_main = new_db_conn()
 col1, col2, col3 = st.columns([1.2, 1, 1])
-
 with col1:
     qlen_now = conn_main.execute("SELECT COUNT(*) as c FROM requests WHERE status='pending'").fetchone()["c"]
     st.metric("Queue length (pending)", qlen_now)
     st.write("Server running:", "Yes" if st.session_state.server_thread and st.session_state.server_thread.is_alive() else "No")
     st.write("Attacker running:", "Yes" if st.session_state.attacker_thread and st.session_state.attacker_thread.is_alive() else "No")
-
 with col2:
     st.metric("Processed total", st.session_state.stats["processed_total"])
     st.metric("Processed fake", st.session_state.stats["processed_fake"])
-
 with col3:
     st.metric("Auth successes", st.session_state.stats["processed_auth_success"])
     st.metric("Auth failures", st.session_state.stats["processed_auth_failed"])
     st.metric("Auth timeouts", st.session_state.stats["auth_timeouts"])
 
 st.markdown("---")
-
-# Client: submit login attempts
 st.subheader("Client: Submit login")
 with st.form("login_form", clear_on_submit=True):
     username = st.text_input("Username", value="admin")
@@ -287,11 +253,8 @@ with st.form("login_form", clear_on_submit=True):
         req_id = db_insert_request(conn, "auth", username=username, password=password)
         db_log(conn, "INFO", f"Client submitted auth id={req_id} user={username}", None)
         st.session_state.event_queue.put({"type":"log","msg":f"{datetime.datetime.utcnow().isoformat()} Client submitted auth id={req_id} user={username}","packet":None})
-        st.success(f"Auth request queued (id={req_id}). Poll logs or enable auto-refresh to see result.")
+        st.success(f"Auth request queued (id={req_id}).")
 
-st.markdown("---")
-
-# Drain events from event_queue (main thread) and update st.session_state.stats safely
 def drain_events(max_items=1000):
     count = 0
     while not st.session_state.event_queue.empty() and count < max_items:
@@ -329,8 +292,7 @@ def drain_events(max_items=1000):
 
 drain_events()
 
-# Show queue chart and logs
-chart_col, logs_col = st.columns([2, 1])
+chart_col, logs_col = st.columns([2,1])
 with chart_col:
     st.subheader("Queue length over time")
     if st.session_state.stats["queue_lengths"]:
@@ -339,17 +301,11 @@ with chart_col:
         if not df.empty:
             df = df.set_index("time")
             st.line_chart(df)
-
 with logs_col:
     st.subheader("Live logs (most recent)")
-    # additionally include logs stored in DB (most recent)
     rows = conn_main.execute("SELECT ts, level, msg, packet FROM logs ORDER BY id DESC LIMIT ?", (MAX_LOGS_SHOWN,)).fetchall()
-    # show top N
     for r in rows[:50]:
-        ts = r["ts"]
-        level = r["level"]
-        msg = r["msg"]
-        packet = r["packet"]
+        ts = r["ts"]; level = r["level"]; msg = r["msg"]; packet = r["packet"]
         if packet:
             st.markdown(f"**{ts}** — `{level}` — {msg}  \n```\n{packet}\n```")
         else:
@@ -377,8 +333,26 @@ if st.button("Export stats snapshot (JSON)"):
     }
     st.download_button("Download snapshot as JSON", data=json.dumps(snapshot, indent=2), file_name="dos_sim_snapshot.json", mime="application/json")
 
-# Auto-refresh
-if st.session_state.auto_refresh:
-    # let server/attacker threads run; we sleep then re-run to update UI
-    time.sleep(1)
-    st.experimental_rerun()
+# --- Safe auto-refresh: prefer streamlit-autorefresh; fall back to manual Refresh button ---
+auto_refresh_enabled = st.session_state.get("auto_refresh", True)
+autorefresh_supported = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    autorefresh_supported = True
+except Exception:
+    autorefresh_supported = False
+
+if auto_refresh_enabled and autorefresh_supported:
+    # st_autorefresh returns an integer incrementing each refresh.
+    # interval milliseconds; this triggers Streamlit-friendly reruns.
+    st_autorefresh(interval=1000, key="dos_sim_autorefresh")
+elif auto_refresh_enabled and not autorefresh_supported:
+    st.warning("streamlit-autorefresh not installed — auto-refresh disabled. Install via: pip install streamlit-autorefresh")
+    if st.button("Refresh UI now"):
+        # manual refresh via user action (no direct experimental_rerun call)
+        pass
+else:
+    if st.button("Refresh UI now"):
+        pass
+
+# done
