@@ -272,6 +272,8 @@ with col3:
     log_placeholder.code(log_text, language="text")
 
 # Simple auto-refresh to see logs and stats update
-if st.session_state.attack_running:
-    time.sleep(0.5) # Refresh every 0.5s
-    st.rerun()
+# We make this unconditional so the UI always reflects the
+# server state (e.g., after a single login attempt).
+# Previously, it only refreshed if the attack was running.
+time.sleep(0.25) # Refresh every 0.25s
+st.rerun()
