@@ -1,279 +1,302 @@
+# dos_simulation.py
 import streamlit as st
-import time
-import queue
-import threading
-import random
+import threading, time, queue, random, datetime
+from collections import deque
 
-# ---
-# 1. Server Simulation (Worker Pool Model)
-# ---
+st.set_page_config(page_title="DoS Attack Simulator (Safe)", layout="wide")
 
-def server_worker_task(server_instance, work_item):
+# ---------- Simulation objects ----------
+class SimRequest:
+    def __init__(self, req_type, user_id=None, username=None, password=None):
+        self.req_type = req_type  # 'auth' or 'fake'
+        self.user_id = user_id
+        self.username = username
+        self.password = password
+        self.arrival = datetime.datetime.now()
+
+# ---------- Session state initialization ----------
+if "sim_running" not in st.session_state:
+    st.session_state.sim_running = False
+if "req_queue" not in st.session_state:
+    st.session_state.req_queue = queue.Queue()
+if "stats" not in st.session_state:
+    st.session_state.stats = {
+        "processed_total": 0,
+        "processed_auth_success": 0,
+        "processed_auth_failed": 0,
+        "processed_fake": 0,
+        "auth_timeouts": 0,
+        "queue_lengths": deque(maxlen=200),
+        "timestamps": deque(maxlen=200),
+        "recent_logs": deque(maxlen=200),
+    }
+if "threads" not in st.session_state:
+    st.session_state.threads = []
+if "stop_event" not in st.session_state:
+    st.session_state.stop_event = threading.Event()
+
+# ---------- Controls ----------
+st.title("DoS Attack Simulator — **Safe** (no network traffic)")
+st.markdown(
     """
-    This function is spawned as a NEW THREAD for *every* accepted request.
-    It simulates the 0.1 seconds of work.
-    """
-    try:
-        # 1. Simulate the work
-        time.sleep(0.1) 
-        
-        # 2. Process the work item and log the result
-        if work_item["type"] == "LOGIN":
-            user = work_item["data"].get("user")
-            pwd = work_item["data"].get("pwd")
-            
-            with server_instance.lock: # Lock to access credentials
-                if server_instance.credentials.get(user) == pwd:
-                    add_server_log(f"✅ [Auth] Login Succeeded for user: {user}")
-                else:
-                    add_server_log(f"❌ [Auth] Login FAILED for user: {user} (Bad Pwd)")
-                    
-        elif work_item["type"] == "FAKE":
-            payload = work_item["data"].get('payload_file', 'unknown')
-            ip = work_item["data"].get('source_ip', 'unknown')
-            add_server_log(f"🔥 [Attack] Processed fake request from {ip} ({payload})")
+- This is an **offline simulation** that models how a server handles legitimate login attempts and a flood of fake requests.
+- **No real network traffic** or attack code is produced.
+- Use this to **learn**, demo, and test mitigation strategies.
+"""
+)
 
-    except Exception as e:
-        # Handle potential errors
-        pass
-    finally:
-        # 3. CRITICAL: Free up the worker slot
-        with server_instance.lock:
-            server_instance.active_workers -= 1
-            st.session_state.active_workers = server_instance.active_workers
-
-class SimulatedServer:
-    def __init__(self, max_workers=10):
-        self.credentials = {"user": "password123"}
-        self.lock = threading.Lock()
-        self.max_workers = max_workers
-        self.active_workers = 0
-
-    def process_request(self, request_type, data):
-        """
-        Simulates accepting a request into the worker pool.
-        If all workers are busy, it returns False (request dropped).
-        """
-        with self.lock:
-            if self.active_workers < self.max_workers:
-                # --- Worker Slot Available ---
-                self.active_workers += 1
-                st.session_state.active_workers = self.active_workers
-                
-                # Create the work item
-                work_item = {"type": request_type, "data": data}
-                
-                # Spawn a new thread to do the work.
-                # This *is* the worker.
-                t = threading.Thread(target=server_worker_task, args=(self, work_item))
-                t.daemon = True
-                t.start()
-                
-                return True # Request was *accepted*
-            else:
-                # --- All Workers Busy ---
-                return False # Request was *dropped*
-
-# ---
-# 2. Streamlit App UI
-# ---
-
-st.set_page_config(layout="wide")
-st.title("🛡️ DoS Simulation (Worker Pool Model)")
-st.warning("This is an educational simulation. No real network traffic is generated.")
-
-# ---
-# 3. Session State Initialization
-# ---
-default_workers = st.session_state.get('setting_max_workers', 10)
-
-if 'server' not in st.session_state:
-    st.session_state.server = SimulatedServer(max_workers=default_workers)
-    
-if 'attack_running' not in st.session_state:
-    st.session_state.attack_running = False
-if 'log' not in st.session_state:
-    st.session_state.log = [] # User/Attacker request log
-if 'server_processing_log' not in st.session_state:
-    st.session_state.server_processing_log = [] # Server worker log
-if 'active_workers' not in st.session_state:
-    st.session_state.active_workers = 0
-if 'setting_max_workers' not in st.session_state:
-    st.session_state.setting_max_workers = default_workers
-if 'setting_num_attackers' not in st.session_state:
-    st.session_state.setting_num_attackers = 1
-if 'setting_attack_speed' not in st.session_state:
-    st.session_state.setting_attack_speed = 10 # Reqs/sec
-
-# Function to add logs
-def add_log(emoji, message):
-    st.session_state.log.insert(0, f"{emoji} {message}")
-    if len(st.session_state.log) > 20: # Keep log short
-        st.session_state.log.pop()
-
-def add_server_log(message):
-    st.session_state.server_processing_log.insert(0, f"{message}")
-    if len(st.session_state.server_processing_log) > 20:
-        st.session_state.server_processing_log.pop()
-
-# ---
-# 4. Attacker Simulation
-# ---
-def attacker_thread(attacker_id):
-    """
-    This function runs in a separate thread.
-    It continuously floods the server with fake requests at the set speed.
-    """
-    while st.session_state.attack_running:
-        # Read speed from session state, so it can be changed live
-        attack_speed = st.session_state.get('setting_attack_speed', 10)
-        if attack_speed <= 0:
-             attack_speed = 1 # Avoid division by zero
-             
-        sleep_time = 1.0 / attack_speed
-        
-        # Create a more descriptive fake payload
-        fake_data = {
-            "payload_file": "data_flood.bin",
-            "source_ip": f"10.{attacker_id}.{random.randint(1,255)}.{random.randint(1,255)}"
-        }
-        
-        success = st.session_state.server.process_request("FAKE", fake_data)
-        
-        if not success:
-            if attacker_id == 0: 
-                add_log("🔴", "[Attacker] Server workers full. Request dropped.")
-        else:
-            if attacker_id == 0:
-                add_log("🔥", "[Attacker] Sent fake request (worker accepted).")
-        
-        time.sleep(sleep_time) # Attacker speed
-
-# ---
-# 5. App Layout
-# ---
-
-# --- Sidebar ---
 with st.sidebar:
-    st.header("Simulation Settings")
-    st.number_input(
-        "Server Worker Pool Size", 
-        min_value=5, max_value=1000, 
-        key='setting_max_workers',
-        help="How many requests the server can handle *at the same time*."
-    )
-    st.slider(
-        "Number of Attackers", 
-        min_value=1, max_value=50, 
-        key='setting_num_attackers'
-    )
-    st.slider(
-        "Attack Speed (reqs/sec per attacker)", 
-        min_value=1, max_value=100, 
-        key='setting_attack_speed'
-    )
+    st.header("Simulation controls")
+    auth_rate = st.slider("Legitimate users: login attempts / sec (total)", 0, 50, 5)
+    num_legit_users = st.slider("Number of legitimate users (simulated)", 1, 10, 3)
+    attacker_rate = st.slider("Attacker flood: requests / sec", 0, 500, 80)
+    server_capacity = st.slider("Server processing capacity (requests / sec)", 1, 200, 25)
+    auth_timeout_s = st.slider("Auth attempt timeout (seconds)", 1, 10, 3)
+    simulation_tick = st.slider("Simulation tick interval (ms)", 200, 2000, 500)
     st.markdown("---")
-    st.subheader("How to Use")
-    st.markdown("1. Set 'Worker Pool Size' to **10**.")
-    st.markdown("2. Set 'Number of Attackers' to **10**.")
-    st.markdown("3. Set 'Attack Speed' to **15**.")
-    st.markdown("4. Click 'Apply & Restart'.")
-    st.markdown("5. Click 'Start Attack'.")
-    st.markdown("6. Watch the 'Server Worker Load' bar fill up.")
-    st.markdown("7. Click 'Attempt Login' and see it fail.")
+    if not st.session_state.sim_running:
+        if st.button("Start simulation"):
+            st.session_state.stop_event.clear()
+            st.session_state.sim_running = True
+    else:
+        if st.button("Stop simulation"):
+            st.session_state.stop_event.set()
+            st.session_state.sim_running = False
 
+    if st.button("Reset stats & queue"):
+        # stop first
+        st.session_state.stop_event.set()
+        st.session_state.sim_running = False
+        # clear queue and stats
+        while not st.session_state.req_queue.empty():
+            try: st.session_state.req_queue.get_nowait()
+            except: break
+        st.session_state.stats = {
+            "processed_total": 0,
+            "processed_auth_success": 0,
+            "processed_auth_failed": 0,
+            "processed_fake": 0,
+            "auth_timeouts": 0,
+            "queue_lengths": deque(maxlen=200),
+            "timestamps": deque(maxlen=200),
+            "recent_logs": deque(maxlen=200),
+        }
+        st.success("Reset complete")
 
-    if st.button("Apply Settings & Restart Server"):
-        st.session_state.attack_running = False # Stop any old attack
-        time.sleep(0.5) # Give threads time to stop
-        
-        st.session_state.server = SimulatedServer(
-            max_workers=st.session_state.setting_max_workers
-        )
-        
-        st.session_state.active_workers = 0
-        st.session_state.log = []
-        st.session_state.server_processing_log = [] # Clear both logs
-        add_log("🔄", f"Server Restarted. Worker Pool Size: {st.session_state.setting_max_workers}")
-        st.rerun()
+# ---------- Server credentials (simulated) ----------
+SERVER_CREDENTIALS = {"admin": "P@ssw0rd"}  # correct credentials for simulation
 
-# --- Main Columns ---
-col1, col2, col3 = st.columns(3)
+# ---------- Worker functions ----------
+def legit_user_worker(stop_event, rate_per_sec, num_users, tick_ms):
+    """
+    Generates legitimate auth requests at an approximate rate.
+    """
+    if rate_per_sec <= 0: 
+        return
+    per_user_rate = rate_per_sec / max(1, num_users)
+    next_fire = [time.time()] * num_users
+    while not stop_event.is_set():
+        now = time.time()
+        for uid in range(num_users):
+            if now >= next_fire[uid]:
+                # create an auth request (simulate some wrong password occasionally)
+                username = "admin" if random.random() < 0.9 else f"user{uid}"
+                # 20% chance to supply wrong password
+                password = SERVER_CREDENTIALS.get("admin") if random.random() < 0.8 else "wrongpass"
+                req = SimRequest("auth", user_id=uid, username=username, password=password)
+                st.session_state.req_queue.put(req)
+                st.session_state.stats["recent_logs"].append(
+                    f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH attempt from user{uid} (username={username})"
+                )
+                # schedule next for this user
+                interval = 1.0 / per_user_rate if per_user_rate > 0 else 1.0
+                # add jitter
+                next_fire[uid] = now + random.uniform(interval * 0.7, interval * 1.3)
+        time.sleep(max(0.01, tick_ms / 1000.0))
 
-# --- COLUMN 1: Attacker ---
-with col1:
-    st.header("💻 Attacker")
-    st.info("The attacker tries to use all available server 'workers'.")
-    
-    if st.button("Start Attack", disabled=st.session_state.attack_running):
-        st.session_state.attack_running = True
-        add_log("⚠️", "Attack Started!")
-        num_attackers = st.session_state.get('setting_num_attackers', 1)
-        for i in range(num_attackers):
-            t = threading.Thread(target=attacker_thread, args=(i,))
-            t.daemon = True
+def attacker_worker(stop_event, rate_per_sec, tick_ms):
+    """
+    Floods the queue with fake requests at given rate.
+    """
+    if rate_per_sec <= 0:
+        return
+    interval = 1.0 / rate_per_sec
+    next_fire = time.time()
+    while not stop_event.is_set():
+        now = time.time()
+        if now >= next_fire:
+            # burst: create between 1 and 3 fake requests sometimes
+            bursts = random.choice([1,1,1,2,3])
+            for _ in range(bursts):
+                req = SimRequest("fake")
+                st.session_state.req_queue.put(req)
+            st.session_state.stats["recent_logs"].append(
+                f"{datetime.datetime.now().strftime('%H:%M:%S')} ATTACKER sent {bursts} fake req(s)"
+            )
+            # schedule next
+            next_fire = now + random.uniform(interval * 0.8, interval * 1.2)
+        time.sleep(max(0.001, tick_ms / 1000.0))
+
+def server_worker(stop_event, capacity_per_sec, auth_timeout):
+    """
+    Processes up to capacity_per_sec requests per second from the queue.
+    Auth requests that wait longer than auth_timeout are considered timed out/failure.
+    """
+    # We'll process in small ticks for smoother behavior
+    tick = 0.25  # seconds
+    processed_per_tick_float = capacity_per_sec * tick
+    remainder = 0.0
+    while not stop_event.is_set():
+        start = time.time()
+        # compute how many to process this tick
+        to_process = int(processed_per_tick_float)
+        remainder += (processed_per_tick_float - to_process)
+        if remainder >= 1.0:
+            to_process += 1
+            remainder -= 1.0
+        processed = 0
+        for _ in range(to_process):
+            if stop_event.is_set():
+                break
+            try:
+                req = st.session_state.req_queue.get(timeout=0.0)
+            except Exception:
+                break
+            # check timeout for auth requests
+            age = (datetime.datetime.now() - req.arrival).total_seconds()
+            if req.req_type == "auth":
+                if age > auth_timeout:
+                    st.session_state.stats["auth_timeouts"] += 1
+                    st.session_state.stats["processed_total"] += 1
+                    st.session_state.stats["processed_auth_failed"] += 1
+                    st.session_state.stats["recent_logs"].append(
+                        f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH timeout for user{req.user_id}"
+                    )
+                else:
+                    # check credentials
+                    correct = SERVER_CREDENTIALS.get(req.username)
+                    if correct is not None and req.password == correct:
+                        st.session_state.stats["processed_auth_success"] += 1
+                        st.session_state.stats["recent_logs"].append(
+                            f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH success user{req.user_id}"
+                        )
+                    else:
+                        st.session_state.stats["processed_auth_failed"] += 1
+                        st.session_state.stats["recent_logs"].append(
+                            f"{datetime.datetime.now().strftime('%H:%M:%S')} AUTH failed user{req.user_id}"
+                        )
+                    st.session_state.stats["processed_total"] += 1
+            else:
+                # fake request processed
+                st.session_state.stats["processed_fake"] += 1
+                st.session_state.stats["processed_total"] += 1
+            processed += 1
+        # update queue length trace
+        qlen = st.session_state.req_queue.qsize()
+        st.session_state.stats["queue_lengths"].append(qlen)
+        st.session_state.stats["timestamps"].append(datetime.datetime.now().strftime("%H:%M:%S"))
+        # sleep until next tick
+        elapsed = time.time() - start
+        to_sleep = max(0.0, tick - elapsed)
+        time.sleep(to_sleep)
+
+# ---------- Manage threads lifecycle ----------
+def ensure_threads_running():
+    # If already running, do nothing
+    if st.session_state.sim_running and (not st.session_state.threads or not any(t.is_alive() for t in st.session_state.threads)):
+        # clear previous stop_event if any
+        st.session_state.stop_event.clear()
+        st.session_state.threads = []
+        # create threads
+        t_legit = threading.Thread(target=legit_user_worker, args=(st.session_state.stop_event, auth_rate, num_legit_users, simulation_tick), daemon=True)
+        t_attack = threading.Thread(target=attacker_worker, args=(st.session_state.stop_event, attacker_rate, simulation_tick), daemon=True)
+        t_server = threading.Thread(target=server_worker, args=(st.session_state.stop_event, server_capacity, auth_timeout_s), daemon=True)
+        st.session_state.threads = [t_legit, t_attack, t_server]
+        for t in st.session_state.threads:
             t.start()
-        st.rerun()
 
-    if st.button("Stop Attack", disabled=not st.session_state.attack_running):
-        st.session_state.attack_running = False
-        add_log("✅", "Attack Stopped.")
-        st.rerun()
+def stop_threads():
+    st.session_state.stop_event.set()
+    # threads are daemon — they will stop when main process ends or after stop_event is set
 
-# --- COLUMN 2: Authentic User ---
+# Start/stop handling
+if st.session_state.sim_running:
+    ensure_threads_running()
+else:
+    stop_threads()
+
+# ---------- UI display: metrics, charts, logs ----------
+col1, col2, col3 = st.columns([1.2, 1, 1])
+with col1:
+    st.subheader("Server queue")
+    qlen = st.session_state.req_queue.qsize()
+    st.metric("Current queue length", qlen)
+    st.write("Processing capacity (req/sec):", server_capacity)
+    st.write("Legit rate (req/sec):", auth_rate)
+    st.write("Attacker rate (req/sec):", attacker_rate)
+
 with col2:
-    st.header("👤 Authentic User")
-    st.info("The user tries to find one free worker for their login request.")
-    
-    with st.form("login_form"):
-        st.text_input("Username", value="user", key="user")
-        st.text_input("Password", value="password123", key="pwd", type="password")
-        submitted = st.form_submit_button("Attempt Login")
+    st.subheader("Auth results")
+    st.metric("Auth successes", st.session_state.stats["processed_auth_success"])
+    st.metric("Auth failures", st.session_state.stats["processed_auth_failed"])
+    st.metric("Auth timeouts", st.session_state.stats["auth_timeouts"])
 
-    if submitted:
-        add_log("⏳", "[User] Attempting to log in...")
-        data = {"user": st.session_state.user, "pwd": st.session_state.pwd}
-        
-        success = st.session_state.server.process_request("LOGIN", data)
-        
-        if success:
-            add_log("⏳", "[User] Login request *accepted*. Waiting for server...")
-        else:
-            add_log("⛔", "[User] LOGIN FAILED. Server workers are all busy, request *dropped*!")
-
-# --- COLUMN 3: Server State ---
 with col3:
-    st.header("📦 Server")
-    st.info("The server processes requests using a fixed number of workers.")
-    
-    current_w = st.session_state.get('active_workers', 0)
-    max_w = st.session_state.server.max_workers
-    
-    # Calculate Server Capacity
-    # Each worker takes 0.1s, so 1 worker = 10 reqs/sec
-    capacity = max_w / 0.1
-    st.metric("Server Worker Load", f"{current_w} / {max_w}", f"~{int(capacity)} req/sec capacity")
-    
-    progress = 0.0
-    if max_w > 0:
-        progress = float(current_w) / max_w
-    st.progress(progress)
+    st.subheader("Traffic & processing")
+    st.metric("Processed total", st.session_state.stats["processed_total"])
+    st.metric("Processed fake", st.session_state.stats["processed_fake"])
 
-    # --- Server Processing Log ---
-    st.subheader("Server Processing Log (Worker Activity)")
-    processing_log_placeholder = st.empty()
-    processing_log_text = "\n".join(st.session_state.server_processing_log)
-    processing_log_placeholder.code(processing_log_text, language="text")
+st.markdown("---")
+# Queue length chart (simple)
+chart_col, log_col = st.columns([2, 1])
+with chart_col:
+    st.subheader("Queue length over time")
+    if st.session_state.stats["queue_lengths"]:
+        # build simple line chart (streamlit expects list of dicts or dataframe)
+        import pandas as pd
+        df = pd.DataFrame({
+            "time": list(st.session_state.stats["timestamps"]),
+            "queue": list(st.session_state.stats["queue_lengths"])
+        })
+        df = df.set_index("time")
+        st.line_chart(df)
 
-    # --- User/Attacker Log ---
-    st.subheader("User & Attacker Request Log")
-    log_placeholder = st.empty()
-    log_text = "\n".join(st.session_state.log)
-    log_placeholder.code(log_text, language="text")
+with log_col:
+    st.subheader("Recent events")
+    # show last 20 logs
+    logs = list(st.session_state.stats["recent_logs"])[-20:][::-1]
+    for l in logs:
+        st.write(l)
 
-# Simple auto-refresh to see logs and stats update
-# We make this unconditional so the UI always reflects the
-# server state (e.g., after a single login attempt).
-# Previously, it only refreshed if the attack was running.
-time.sleep(0.25) # Refresh every 0.25s
-st.rerun()
+st.markdown("---")
+st.subheader("Simulation details / what this models")
+st.markdown(
+    """
+    - **This is a behavioural simulator**: it does not send any traffic or attempt to overload real servers.
+    - **Legitimate users** are modelled as periodic login attempts (some correct credentials, some wrong).
+    - **Attacker** is modelled as a high-rate generator of "fake" requests that consume server capacity and cause queueing.
+    - **Server** processes a limited number of requests per second; auth requests that wait longer than the configured timeout count as timeouts (failed logins).
+    - Use the sliders to change rates and server capacity and observe how queue length and timeouts change.
+    """
+)
+
+st.markdown("----")
+st.caption("Safe simulation for learning and testing. No real networking or attack code is present.")
+
+# allow exporting stats snapshot
+if st.button("Export stats snapshot (JSON)"):
+    import json
+    snapshot = {
+        "processed_total": st.session_state.stats["processed_total"],
+        "processed_auth_success": st.session_state.stats["processed_auth_success"],
+        "processed_auth_failed": st.session_state.stats["processed_auth_failed"],
+        "processed_fake": st.session_state.stats["processed_fake"],
+        "auth_timeouts": st.session_state.stats["auth_timeouts"],
+        "queue_length_now": st.session_state.req_queue.qsize(),
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    st.download_button("Download snapshot as JSON", data=json.dumps(snapshot, indent=2), file_name="dos_sim_snapshot.json", mime="application/json")
+
+# small keep-alive to update UI frequently
+time.sleep(0.01)
+st.experimental_rerun()
