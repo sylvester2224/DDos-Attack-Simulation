@@ -10,18 +10,32 @@ import threading
 def server_worker(server_instance):
     """
     This runs in a separate thread, simulating the server's *actual* work.
-    It pulls from the queue and "processes" items one by one.
-    This represents the server's fixed processing capacity (e.g., 10 reqs/sec).
+    It pulls from the queue, processes the item, and logs the *result*.
     """
     while True:
         try:
             # Get an item from the queue (this blocks until an item is available)
-            server_instance.request_queue.get()
+            work_item = server_instance.request_queue.get()
             
             # Simulate the work (e.g., 0.1 seconds)
-            # This is the server's *actual* processing speed bottleneck.
             time.sleep(0.1) 
             
+            # --- Process the work item ---
+            if work_item["type"] == "LOGIN":
+                user = work_item["data"].get("user")
+                pwd = work_item["data"].get("pwd")
+                
+                with server_instance.lock: # Access credentials safely
+                    if server_instance.credentials.get(user) == pwd:
+                        add_server_log(f"✅ [Auth] Login Succeeded for user: {user}")
+                    else:
+                        add_server_log(f"❌ [Auth] Login FAILED for user: {user} (Bad Pwd)")
+                        
+            elif work_item["type"] == "FAKE":
+                payload = work_item["data"].get('payload_file', 'unknown')
+                ip = work_item["data"].get('source_ip', 'unknown')
+                add_server_log(f"🔥 [Flood] Processed fake request from {ip} ({payload})")
+
             # Mark the task as done
             server_instance.request_queue.task_done()
             
@@ -30,7 +44,7 @@ def server_worker(server_instance):
                 st.session_state.current_queue_size = server_instance.request_queue.qsize()
                 
         except Exception as e:
-            # Handle potential errors (e.g., if queue is shut down)
+            # Handle potential errors
             pass
 
 class SimulatedServer:
@@ -45,6 +59,7 @@ class SimulatedServer:
         Simulates *accepting* a request into the queue.
         If the queue is full, it returns False (request dropped).
         This function is thread-safe and *fast*.
+        It NO LONGER checks credentials; the worker does.
         """
         with self.lock:
             # Update queue size for UI
@@ -53,20 +68,11 @@ class SimulatedServer:
             if self.request_queue.full():
                 return False  # Request dropped
             
-            # If it's a login, check credentials
-            if request_type == "LOGIN":
-                user = data.get("user")
-                pwd = data.get("pwd")
-                if self.credentials.get(user) == pwd:
-                    result = "Login Successful"
-                else:
-                    result = "Login Failed"
-            else:
-                # Fake requests are just processed
-                result = "Fake Request Processed"
+            # Just create the work item and queue it
+            item_to_queue = {"type": request_type, "data": data}
             
             # Add to queue for the *worker* to process
-            self.request_queue.put(result)
+            self.request_queue.put(item_to_queue)
             st.session_state.current_queue_size = self.request_queue.qsize() # Update UI
             return True # Request was *queued*
 
@@ -81,7 +87,6 @@ st.warning("This is an educational simulation. No real network traffic is genera
 # ---
 # 3. Session State Initialization
 # ---
-# Use .get() to avoid re-initializing
 default_queue_size = st.session_state.get('setting_queue_size', 20)
 
 if 'server' not in st.session_state:
@@ -94,7 +99,9 @@ if 'server' not in st.session_state:
 if 'attack_running' not in st.session_state:
     st.session_state.attack_running = False
 if 'log' not in st.session_state:
-    st.session_state.log = []
+    st.session_state.log = [] # This is the main "User/Attacker" log
+if 'server_processing_log' not in st.session_state:
+    st.session_state.server_processing_log = [] # This is the new "Server Worker" log
 if 'current_queue_size' not in st.session_state:
     st.session_state.current_queue_size = 0
 if 'setting_queue_size' not in st.session_state:
@@ -110,6 +117,12 @@ def add_log(emoji, message):
     if len(st.session_state.log) > 20: # Keep log short
         st.session_state.log.pop()
 
+# NEW function for the server worker log
+def add_server_log(message):
+    st.session_state.server_processing_log.insert(0, f"{message}")
+    if len(st.session_state.server_processing_log) > 20:
+        st.session_state.server_processing_log.pop()
+
 # ---
 # 4. Attacker Simulation
 # ---
@@ -119,19 +132,21 @@ def attacker_thread(attacker_id):
     It continuously floods the server with fake requests.
     """
     while st.session_state.attack_running:
-        # Read speed from session state, so it can be changed live
         attack_speed = st.session_state.get('setting_attack_speed', 20)
         sleep_time = 1.0 / attack_speed
         
-        # Now calls the *fast* process_request
-        success = st.session_state.server.process_request("FAKE", {})
+        # Create a more descriptive fake payload
+        fake_data = {
+            "payload_file": "data_flood.bin",
+            "source_ip": f"10.{attacker_id}.{attacker_id % 255}.{attacker_id % 100}"
+        }
+        
+        success = st.session_state.server.process_request("FAKE", fake_data)
         
         if not success:
-            # Only log drops from one attacker to avoid log spam
             if attacker_id == 0: 
                 add_log("🔴", "[Attacker] Server queue full. Request dropped.")
         else:
-            # Only log success from one attacker
             if attacker_id == 0:
                 add_log("🔥", "[Attacker] Sent fake request.")
         
@@ -144,41 +159,23 @@ def attacker_thread(attacker_id):
 # --- Sidebar ---
 with st.sidebar:
     st.header("Simulation Settings")
-    
-    st.number_input(
-        "Server Queue Size", 
-        min_value=10, max_value=1000, 
-        key='setting_queue_size'
-    )
-    
-    st.slider(
-        "Number of Attackers", 
-        min_value=1, max_value=50, 
-        key='setting_num_attackers'
-    )
-    
-    st.slider(
-        "Attack Speed (reqs/sec per attacker)", 
-        min_value=1, max_value=100, 
-        key='setting_attack_speed'
-    )
+    st.number_input("Server Queue Size", min_value=10, max_value=1000, key='setting_queue_size')
+    st.slider("Number of Attackers", min_value=1, max_value=50, key='setting_num_attackers')
+    st.slider("Attack Speed (reqs/sec per attacker)", min_value=1, max_value=100, key='setting_attack_speed')
 
     if st.button("Apply Settings & Restart Server"):
         st.session_state.attack_running = False # Stop any old attack
         time.sleep(0.5) # Give threads time to stop
         
-        # Create the new server
-        st.session_state.server = SimulatedServer(
-            queue_size=st.session_state.setting_queue_size
-        )
+        st.session_state.server = SimulatedServer(queue_size=st.session_state.setting_queue_size)
         
-        # Start a worker for the *new* server
         worker_t = threading.Thread(target=server_worker, args=(st.session_state.server,))
         worker_t.daemon = True
         worker_t.start()
         
         st.session_state.current_queue_size = 0
         st.session_state.log = []
+        st.session_state.server_processing_log = [] # Clear both logs
         add_log("🔄", f"Server Restarted. Queue Size: {st.session_state.setting_queue_size}")
         add_log("🚀", "Server worker thread started.")
         st.rerun()
@@ -194,11 +191,10 @@ with col1:
     if st.button("Start Attack", disabled=st.session_state.attack_running):
         st.session_state.attack_running = True
         add_log("⚠️", "Attack Started!")
-        
         num_attackers = st.session_state.get('setting_num_attackers', 1)
         for i in range(num_attackers):
             t = threading.Thread(target=attacker_thread, args=(i,))
-            t.daemon = True # Ensure thread closes when app stops
+            t.daemon = True
             t.start()
         st.rerun()
 
@@ -221,7 +217,6 @@ with col2:
         add_log("⏳", "[User] Attempting to log in...")
         data = {"user": st.session_state.user, "pwd": st.session_state.pwd}
         
-        # This now calls the fast-queuing function
         success = st.session_state.server.process_request("LOGIN", data)
         
         if success:
@@ -234,20 +229,23 @@ with col3:
     st.header("📦 Server")
     st.info("A background worker processes ~10 reqs/sec. If the queue fills, requests are dropped.")
     
-    # Get current and max queue size
     current_q = st.session_state.get('current_queue_size', 0)
     max_q = st.session_state.server.max_size
-    
     st.metric("Server Queue Load", f"{current_q} / {max_q}")
     
-    # Calculate progress, avoid division by zero
     progress = 0.0
     if max_q > 0:
         progress = float(current_q) / max_q
-        
     st.progress(progress)
 
-    st.subheader("Server Activity Log")
+    # --- NEW: Server Processing Log ---
+    st.subheader("Server Processing Log (Worker Thread)")
+    processing_log_placeholder = st.empty()
+    processing_log_text = "\n".join(st.session_state.server_processing_log)
+    processing_log_placeholder.code(processing_log_text, language="text")
+
+    # --- Renamed: User/Attacker Log ---
+    st.subheader("User & Attacker Request Log")
     log_placeholder = st.empty()
     log_text = "\n".join(st.session_state.log)
     log_placeholder.code(log_text, language="text")
